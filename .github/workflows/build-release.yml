@@ -1,0 +1,215 @@
+name: Build and create Windows release
+
+on:
+  workflow_dispatch:
+
+env:
+  CHERE_INVOKING: 1
+  APP_NAME: disk-utilities
+  DIST_DIRECTORY: dist
+
+jobs:
+
+  build:
+    name: Build ${{ matrix.variant }}
+    runs-on: windows-latest
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: win32-mingw
+            shell: 'msys2 {0}'
+            include_dir: /mingw32/include/
+            runtime_dlls: /mingw32/bin/libdl.dll /mingw32/bin/libgcc_s_dw2-1.dll /mingw32/bin/libwinpthread-1.dll
+            capsimg_dir:
+            msystem: MINGW32
+            msys2_packages: >-
+              make
+              mingw-w64-i686-gcc
+              mingw-w64-i686-dlfcn
+              wget
+              tar
+              zip
+              unzip
+          - variant: win64-mingw
+            shell: 'msys2 {0}'
+            include_dir: /mingw64/include/
+            runtime_dlls: /mingw64/bin/libdl.dll
+            capsimg_dir: x64/
+            msystem: MINGW64
+            msys2_packages: >-
+              make
+              mingw-w64-x86_64-gcc
+              mingw-w64-x86_64-dlfcn
+              wget
+              tar
+              zip
+              unzip
+          - variant: win64-ucrt
+            shell: 'msys2 {0}'
+            include_dir: /ucrt64/include/
+            runtime_dlls: /ucrt64/bin/libdl.dll
+            capsimg_dir: x64/
+            msystem: UCRT64
+            msys2_packages: >-
+              make
+              mingw-w64-ucrt-x86_64-gcc
+              mingw-w64-ucrt-x86_64-dlfcn
+              wget
+              tar
+              zip
+              unzip
+          - variant: win64-cygwin
+            shell: 'D:\cygwin\bin\bash.exe --login --norc -eo pipefail -o igncr {0}'
+            include_dir: /usr/include/
+            runtime_dlls: /usr/bin/cygwin1.dll
+            capsimg_dir: x64/
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+        
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install MSYS2
+        if: matrix.msystem != ''
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: ${{ matrix.msys2_packages }}
+
+      - name: Install Cygwin
+        if: matrix.variant == 'win64-cygwin'
+        uses: cygwin/cygwin-install-action@v6
+        with:
+          packages: |
+            make
+            gcc-core
+            wget
+            tar
+            zip
+            unzip
+
+      - name: Download Softpres IPF Support Library
+        run: |
+          wget -O ipflib42_linux-x86_64.tar.gz http://www.softpres.org/_media/files:ipflib42_linux-x86_64.tar.gz
+          tar xf ipflib42_linux-x86_64.tar.gz
+          cp -r x86_64-linux-gnu-capsimage/include/caps ${{ matrix.include_dir }}
+          wget -O spsdeclib_5.1_windows.zip https://softpres.org/_media/files:spsdeclib_5.1_windows.zip
+          unzip spsdeclib_5.1_windows.zip
+
+      - name: Build
+        run: |
+          make clean
+          caps=y make all
+          make -C imdinfo
+          make -C ipfinfo
+          make -C m68k
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p ${{ env.DIST_DIRECTORY }}
+          find . -not -path './${{ env.DIST_DIRECTORY }}/*' -not -path './tests*/*' -name '*.exe' -exec cp {} ${{ env.DIST_DIRECTORY }}/ \;
+          cp ./libdisk/libdisk.0.0.dll ${{ env.DIST_DIRECTORY }}/
+          cp ./disk-analyse/formats ${{ env.DIST_DIRECTORY }}/
+          cp ./capsimg_binary/${{matrix.capsimg_dir}}CAPSImg.dll ${{ env.DIST_DIRECTORY }}/
+          for dll in ${{ matrix.runtime_dlls }}; do
+            cp "$dll" ${{ env.DIST_DIRECTORY }}/
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.variant }}
+          path: ${{ env.DIST_DIRECTORY }}/
+
+      - name: Smoke tests
+        shell: cmd
+        run: |
+          cd ${{ env.DIST_DIRECTORY }}
+          set "PATH=%CD%;%SystemRoot%\system32;%SystemRoot%"
+          icacls . /reset /T
+
+          echo "Testing disk-analyse"
+          disk-analyse.exe ..\tests.fork\fixtures\blank_amiga.scp ..\tests.fork\output\blank_scp.adf
+          if not exist ..\tests.fork\output\blank_scp.adf exit /b 1
+          fc /a /b ..\tests.fork\output\blank_scp.adf ..\tests.fork\fixtures\blank_amiga.adf 1>nul
+          if errorlevel 1 exit /b 1
+          disk-analyse.exe --format="amigados" ..\tests.fork\fixtures\blank_amiga.ipf ..\tests.fork\output\blank_ipf.adf
+          if not exist ..\tests.fork\output\blank_ipf.adf exit /b 1
+          fc /a /b ..\tests.fork\output\blank_ipf.adf ..\tests.fork\fixtures\blank_amiga.adf 1>nul
+          if errorlevel 1 exit /b 1
+
+          echo "Testing adfread"
+          adfread.exe ..\tests.fork\fixtures\simple_amiga.adf 1>nul
+
+          echo "Testing adfwrite"
+          copy /b ..\tests.fork\fixtures\blank_amiga.adf ..\tests.fork\output\adfwrite_test.adf
+          adfwrite.exe ..\tests.fork\output\adfwrite_test.adf ..\tests.fork\fixtures\Cube-O-Bootic.bin 0 1 -r
+          if not exist ..\tests.fork\output\adfwrite_test.adf exit /b 1
+          fc /a /b ..\tests.fork\output\adfwrite_test.adf ..\tests.fork\fixtures\Cube-O-Bootic.adf 1>nul
+          if errorlevel 1 exit /b 1
+
+          echo "Testing adfbb"
+          copy /b ..\tests.fork\fixtures\Cube-O-Bootic.adf ..\tests.fork\output\adfbb_test.adf
+          adfbb.exe ..\tests.fork\output\adfbb_test.adf -w
+          if not exist ..\tests.fork\output\adfbb_test.adf exit /b 1
+          fc /a /b ..\tests.fork\output\adfbb_test.adf ..\tests.fork\fixtures\blank_amiga.adf 1>nul
+          if errorlevel 1 exit /b 1
+
+          echo "Testing ipfinfo"
+          ipfinfo.exe ..\tests.fork\fixtures\blank_amiga.ipf 1>nul
+
+          echo "Testing imdinfo"
+          imdinfo.exe -t ..\tests.fork\fixtures\blank_pc.imd
+
+          echo "m68k: disassemble, copylock and m68k_emulate don't have tests yet"
+
+  release:
+    name: Release
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get date
+        id: date
+        run: |
+          echo "date_compact=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "date_readable=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ env.APP_NAME }}-*
+          path: ${{ env.DIST_DIRECTORY }}/
+
+      - name: Create release archives
+        run: |
+          shopt -s nullglob
+          for dir in ${{ env.DIST_DIRECTORY }}/${{ env.APP_NAME }}-*/; do
+            name=$(basename "$dir")
+            (cd "$dir" && zip -r "../../${name}-${{ steps.date.outputs.date_compact }}.zip" .)
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.date.outputs.date_compact }}-${{ github.run_number }}
+          name: ${{ env.APP_NAME }} ${{ steps.date.outputs.date_readable }}
+          body: |
+            Build of commit ${{ github.sha }}
+          files: |
+              ${{ env.APP_NAME }}-*.zip
+          make_latest: true
+          generate_release_notes: false
+          token: ${{ secrets.GITHUB_TOKEN }}
